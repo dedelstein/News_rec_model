@@ -43,6 +43,58 @@ class PointwiseAttention(nn.Module):
         concat = torch.cat([history, target, diff, pw_prod], dim=-1)
         return self.mlp(concat)
 
+class PointwiseAttentionExpanded(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.mlp = MLP(input_dim * 4, 1)
+    
+    def forward(self, target, history):
+        """
+        Compute pointwise attention scores for batched inputs
+        
+        Args:
+            target: Shape [batch_size, 1, embed_dim] or [batch_size, num_targets, embed_dim]
+            history: Shape [batch_size, num_history, embed_dim]
+            
+        Returns:
+            attention_scores: Shape [batch_size, num_targets, num_history, 1]
+        """
+        # Add target sequence dimension if needed
+        if len(target.shape) == 2:
+            target = target.unsqueeze(1)  # [batch_size, 1, embed_dim]
+            
+        batch_size, num_targets, embed_dim = target.shape
+        num_history = history.shape[1]
+        
+        # Reshape target to align with history for broadcasting,  [batch_size, num_targets, 1, embed_dim]
+        target_expanded = target.unsqueeze(2)
+        
+        # Reshape history to align with target for broadcasting, [batch_size, 1, num_history, embed_dim]
+        history_expanded = history.unsqueeze(1)
+        
+        # Create interaction features, each will be [batch_size, num_targets, num_history, embed_dim]
+        diff = target_expanded - history_expanded
+        pw_prod = target_expanded * history_expanded
+        
+        # Concatenate along feature dimension, [batch_size, num_targets, num_history, embed_dim * 4]
+        concat = torch.cat([
+            history_expanded.expand(-1, num_targets, -1, -1),
+            target_expanded.expand(-1, -1, num_history, -1),
+            diff, 
+            pw_prod
+        ], dim=-1)
+        
+        # Reshape for MLP, [batch_size * num_targets * num_history, embed_dim * 4]
+        flat_concat = concat.view(-1, embed_dim * 4)
+        
+        # Apply MLP, [batch_size * num_targets * num_history, 1]
+        scores = self.mlp(flat_concat)
+        
+        # Reshape back, [batch_size, num_targets, num_history, 1]
+        attention_scores = scores.view(batch_size, num_targets, num_history, 1)
+        
+        return attention_scores
+
 #e_u
 class UserSideInterest(nn.Module):
     def __init__(self, user_history_embedder, article_embedder, embedding_dim):
