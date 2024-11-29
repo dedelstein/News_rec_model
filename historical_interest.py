@@ -37,63 +37,16 @@ class PointwiseAttention(nn.Module):
         self.mlp = MLP(input_dim * 4, 1)
     
     def forward(self, target, history):
-        # Create interaction features as described in paper
-        diff = target - history
-        pw_prod = target * history
-        concat = torch.cat([history, target, diff, pw_prod], dim=-1)
-        return self.mlp(concat)
 
-class PointwiseAttentionExpanded(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.mlp = MLP(input_dim * 4, 1)
-    
-    def forward(self, target, history):
-        """
-        Compute pointwise attention scores for batched inputs
-        
-        Args:
-            target: Shape [batch_size, 1, embed_dim] or [batch_size, num_targets, embed_dim]
-            history: Shape [batch_size, num_history, embed_dim]
-            
-        Returns:
-            attention_scores: Shape [batch_size, num_targets, num_history, 1]
-        """
-        # Add target sequence dimension if needed
-        if len(target.shape) == 2:
-            target = target.unsqueeze(1)  # [batch_size, 1, embed_dim]
-            
-        batch_size, num_targets, embed_dim = target.shape
-        num_history = history.shape[1]
-        
-        # Reshape target to align with history for broadcasting,  [batch_size, num_targets, 1, embed_dim]
-        target_expanded = target.unsqueeze(2)
-        
-        # Reshape history to align with target for broadcasting, [batch_size, 1, num_history, embed_dim]
-        history_expanded = history.unsqueeze(1)
-        
-        # Create interaction features, each will be [batch_size, num_targets, num_history, embed_dim]
-        diff = target_expanded - history_expanded
-        pw_prod = target_expanded * history_expanded
-        
-        # Concatenate along feature dimension, [batch_size, num_targets, num_history, embed_dim * 4]
-        concat = torch.cat([
-            history_expanded.expand(-1, num_targets, -1, -1),
-            target_expanded.expand(-1, -1, num_history, -1),
-            diff, 
-            pw_prod
-        ], dim=-1)
-        
-        # Reshape for MLP, [batch_size * num_targets * num_history, embed_dim * 4]
-        flat_concat = concat.view(-1, embed_dim * 4)
-        
-        # Apply MLP, [batch_size * num_targets * num_history, 1]
-        scores = self.mlp(flat_concat)
-        
-        # Reshape back, [batch_size, num_targets, num_history, 1]
-        attention_scores = scores.view(batch_size, num_targets, num_history, 1)
-        
-        return attention_scores
+      target = target.expand(-1, history.size(1), -1)  # [batch_size, num_history, embed_dim]
+
+      # Interaction features
+      diff = target - history
+      pw_prod = target * history
+
+      concat = torch.cat([history, target, diff, pw_prod], dim=-1)
+
+      return self.mlp(concat)
 
 #e_u
 class UserSideInterest(nn.Module):
@@ -105,19 +58,16 @@ class UserSideInterest(nn.Module):
         self.attention = PointwiseAttention(embedding_dim * 4)
         
     def forward(self, article_ids, read_times, scroll_percentages, target_article_df):
-        batch_size, seq_len = article_ids.shape
         
-        # Get historical embeddings (e_j) - returns transformed embeddings via W1, then get e_i
+        # Get embeddings and print shapes
         historical_combined = self.user_history_embedder(article_ids, read_times, scroll_percentages)
         target_embedding = self.article_embedder(target_article_df)
         
-        # Expand target embedding for broadcasting
-        target_expanded = target_embedding.unsqueeze(1)  # Shape: (batch_size, 1, 256)
-        
-        # Compute attention weights, e_i, e_j &  apply attention weights without softmax
+        # Reshape target for attention
+        target_expanded = target_embedding.unsqueeze(1).expand(-1, historical_combined.size(1), -1)
         attention_weights = self.attention(target_expanded, historical_combined)
         user_interest = torch.sum(attention_weights * historical_combined, dim=1)
-        
+
         return user_interest
     
     def get_embedding_dim(self):
@@ -183,22 +133,26 @@ class MultiModalInterest(nn.Module):
         stacked = np.stack(combined_embeddings)
         return torch.tensor(stacked, dtype=torch.float32).to(self.device)
     
-    def forward(self, target_article_ids, history_article_ids) -> torch.Tensor:
-        """Compute e'u (multimodal user interest) for given target and history articles"""
-        # Get embeddings
-        target_embeddings = self._get_combined_embeddings(target_article_ids)  # [num_targets, embed_dim]
-        history_embeddings = self._get_combined_embeddings(history_article_ids)  # [num_history, embed_dim]
+    def forward(self, target_article_ids, history_article_ids):
+
+      # Ensure embeddings are aligned
+      target_embeddings = self._get_combined_embeddings(target_article_ids)
+      history_embeddings = self._get_combined_embeddings(history_article_ids.flatten())
+
+      # Reshape history to match batch size and number of history items
+      batch_size, num_history = history_article_ids.shape
+      history_embeddings = history_embeddings.view(batch_size, num_history, -1)
+      #printf"History embeddings shape (reshaped): {history_embeddings.shape}")
+
+      # Expand target for alignment
+      target_expanded = target_embeddings.unsqueeze(1)
+      attention_scores = self.attention(target_expanded, history_embeddings)  # Align batch size
+
+      # Weighted sum
+      e_u_prime = torch.sum(attention_scores * history_embeddings, dim=1)
+
+      return e_u_prime
         
-        # Add batch and sequence dimensions to target
-        target_embeddings = target_embeddings.unsqueeze(1)  # [num_targets, 1, embed_dim]
-        
-        # Compute attention scores
-        attention_scores = self.attention(target_embeddings, history_embeddings)  # [num_targets, num_history, 1]
-        
-        # Compute e'u
-        e_u_prime = torch.sum(attention_scores * history_embeddings.unsqueeze(0), dim=1)
-        return e_u_prime
-    
 class HistoricUserInterest(nn.Module):
     """
     Combines user side interests (e_u from historical behaviors + engagement) 
